@@ -1,0 +1,798 @@
+/**
+ * Adapter Transform Functions
+ *
+ * Shared transforms for converting Claude Code plugin content into
+ * OpenCode and Codex adapter formats. Used by:
+ *   - bin/cli.js (npm installer)
+ *   - scripts/dev-install.js (development installer)
+ *   - scripts/gen-adapters.js (static adapter generation)
+ *
+ * @module adapter-transforms
+ * @author Avi Fenesh
+ * @license MIT
+ */
+
+const path = require('path');
+const discovery = require('./discovery');
+
+function transformBodyForOpenCode(content, repoRoot) {
+  const plugins = discovery.discoverPlugins(repoRoot);
+  content = pointVersionedPathsAtInstallLayout(content, undefined, plugins);
+  content = content.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, '${PLUGIN_ROOT}');
+  content = content.replace(/\$CLAUDE_PLUGIN_ROOT/g, '$PLUGIN_ROOT');
+
+  // Replace .claude/ paths with .opencode/ but preserve platform documentation lists
+  // that enumerate all three platforms (Claude Code: .claude/, OpenCode: .opencode/, Codex: .codex/)
+  // Also preserve {AI_STATE_DIR} references which are platform-agnostic
+  content = content.replace(/\.claude\//g, (match, offset) => {
+    const context = content.substring(Math.max(0, offset - 60), offset + match.length + 10);
+    // Skip if inside a platform enumeration (e.g., "Claude Code: `.claude/`")
+    if (/Claude Code:/.test(context)) return match;
+    return '.opencode/';
+  });
+  content = content.replace(/\.claude'/g, (match, offset) => {
+    const context = content.substring(Math.max(0, offset - 60), offset + match.length + 10);
+    if (/Claude Code:/.test(context)) return match;
+    return ".opencode'";
+  });
+  content = content.replace(/\.claude"/g, (match, offset) => {
+    const context = content.substring(Math.max(0, offset - 60), offset + match.length + 10);
+    if (/Claude Code:/.test(context)) return match;
+    return '.opencode"';
+  });
+  content = content.replace(/\.claude`/g, (match, offset) => {
+    const context = content.substring(Math.max(0, offset - 60), offset + match.length + 10);
+    if (/Claude Code:/.test(context)) return match;
+    return '.opencode`';
+  });
+
+  if (plugins.length > 0) {
+    const pluginNames = plugins.join('|');
+    content = content.replace(new RegExp('`(' + pluginNames + '):([a-z-]+)`', 'g'), '`$2`');
+    content = content.replace(new RegExp('(' + pluginNames + '):([a-z-]+)', 'g'), '$2');
+  }
+
+  content = content.replace(
+    /```(\w*)\n([\s\S]*?)```/g,
+    (match, lang, code) => {
+      const langLower = (lang || '').toLowerCase();
+
+      if (langLower === 'bash' || langLower === 'shell' || langLower === 'sh') {
+        if (code.includes('node -e') && code.includes('require(')) {
+          return '*(Bash command with Node.js require - adapt for OpenCode)*';
+        }
+        return match;
+      }
+
+      if (!lang && (code.trim().startsWith('gh ') || code.trim().startsWith('glab ') ||
+          code.trim().startsWith('git ') || code.trim().startsWith('#!'))) {
+        return match;
+      }
+
+      if (code.includes('require(') || code.includes('Task(') ||
+          /^\s*const\s+[a-zA-Z_$[{]/m.test(code) || /^\s*let\s+[a-zA-Z_$[{]/m.test(code) ||
+          code.includes('function ') || code.includes('=>') ||
+          code.includes('async ') || code.includes('await ') ||
+          code.includes('completePhase')) {
+
+        let instructions = '';
+
+        const taskMatches = [...code.matchAll(/(?:await\s+)?Task\s*\(\s*\{[^}]*subagent_type:\s*["'](?:[^"':]+:)?([^"']+)["'][^}]*\}\s*\)/gs)];
+        for (const taskMatch of taskMatches) {
+          const agent = taskMatch[1];
+          instructions += `- Invoke \`@${agent}\` agent\n`;
+        }
+
+        const phaseMatches = code.match(/startPhase\s*\(\s*['"]([^'"]+)['"]\s*\)/g);
+        if (phaseMatches) {
+          for (const pm of phaseMatches) {
+            const phase = pm.match(/['"]([^'"]+)['"]/)[1];
+            instructions += `- Phase: ${phase}\n`;
+          }
+        }
+
+        if (code.includes('AskUserQuestion')) {
+          instructions += '- Use AskUserQuestion tool for user input\n';
+        }
+
+        if (code.includes('EnterPlanMode')) {
+          instructions += '- Use EnterPlanMode for user approval\n';
+        }
+
+        if (code.includes('completePhase')) {
+          instructions += '- Call `workflowState.completePhase(result)` to advance workflow state\n';
+        }
+
+        if (instructions) {
+          return instructions;
+        }
+
+        return '*(JavaScript reference - not executable in OpenCode)*';
+      }
+
+      return match;
+    }
+  );
+
+  content = content.replace(/\*\(Reference - adapt for OpenCode\)\*/g, '');
+
+  content = content.replace(/await\s+Task\s*\(\s*\{[\s\S]*?\}\s*\);?/g, (match) => {
+    const agentMatch = match.match(/subagent_type:\s*["'](?:[^"':]+:)?([^"']+)["']/);
+    if (agentMatch) {
+      return `Invoke \`@${agentMatch[1]}\` agent`;
+    }
+    return '*(Task call - use @agent-name syntax)*';
+  });
+
+  content = content.replace(/(?:const|let|var)\s+\{?[^}=\n]+\}?\s*=\s*require\s*\([^)]+\);?/g, '');
+  content = content.replace(/require\s*\(['"][^'"]+['"]\)/g, '');
+
+  // An install path (`<home>/.agentsys/plugins/...`) is not a mention of
+  // agents, even when the home directory has "agent" in it: drop those paths
+  // before the check.
+  if (/agent(?!sys)/.test(content.replace(/[^\s`'"()]*\.agentsys[\\/][^\s`'"()]*/g, ''))) {
+    const note = `
+> **OpenCode Note**: Invoke agents using \`@agent-name\` syntax.
+> Available agents: task-discoverer, exploration-agent, planning-agent,
+> implementation-agent, deslop-agent, delivery-validator, sync-docs-agent, consult-agent
+> Example: \`@exploration-agent analyze the codebase\`
+
+`;
+    content = content.replace(/^(---\n[\s\S]*?---\n)/, `$1${note}`);
+  }
+
+  if (content.includes('Master Workflow Orchestrator') && content.includes('No Shortcuts Policy')) {
+    const policySection = `
+## Phase 1: Policy Selection (Built-in Options)
+
+Ask the user these questions using AskUserQuestion:
+
+**Question 1 - Source**: "Where should I look for tasks?"
+- GitHub Issues - Use \`gh issue list\` to find issues
+- GitHub Projects - Issues from a GitHub Project board
+- GitLab Issues - Use \`glab issue list\` to find issues
+- Local tasks.md - Read from PLAN.md, tasks.md, or TODO.md in the repo
+- Custom - User specifies their own source
+- Other - User describes source, you figure it out
+
+If user selects GitHub Projects, ask two follow-up questions: project number (positive integer from the project URL, e.g. 1, 5, 42) and project owner (@me for your own projects, or the org/username). Pass as responses.project = { number, owner } to parseAndCachePolicy.
+
+**Question 2 - Priority**: "What type of tasks to prioritize?"
+- All - Consider all tasks, pick by score
+- Bugs - Focus on bug fixes
+- Security - Security issues first
+- Features - New feature development
+
+**Question 3 - Stop Point**: "How far should I take this task?"
+- Merged - Until PR is merged to main
+- PR Created - Stop after creating PR
+- Implemented - Stop after local implementation
+- Deployed - Deploy to staging
+- Production - Full production deployment
+
+After user answers, proceed to Phase 2 with the selected policy.
+
+`;
+    if (content.includes('OpenCode Note')) {
+      content = content.replace(/(Example:.*analyze the codebase\`\n\n)/, `$1${policySection}`);
+    }
+  }
+
+  return content;
+}
+
+function transformCommandFrontmatterForOpenCode(content) {
+  return content.replace(
+    /^---\n([\s\S]*?)^---/m,
+    (match, frontmatter) => {
+      // Parse existing frontmatter
+      const lines = frontmatter.trim().split('\n');
+      const parsed = {};
+      for (const line of lines) {
+        const colonIdx = line.indexOf(':');
+        if (colonIdx > 0) {
+          const key = line.substring(0, colonIdx).trim();
+          const value = line.substring(colonIdx + 1).trim();
+          parsed[key] = value;
+        }
+      }
+
+      // Build OpenCode command frontmatter
+      let opencodeFrontmatter = '---\n';
+      if (parsed.description) opencodeFrontmatter += `description: ${parsed.description}\n`;
+      opencodeFrontmatter += 'agent: general\n';
+      // Don't include argument-hint or allowed-tools (not supported)
+      opencodeFrontmatter += '---';
+      return opencodeFrontmatter;
+    }
+  );
+}
+
+function transformAgentFrontmatterForOpenCode(content, options) {
+  const { stripModels = true } = options || {};
+
+  return content.replace(
+    /^---\n([\s\S]*?)^---/m,
+    (match, frontmatter) => {
+      // Parse existing frontmatter
+      const lines = frontmatter.trim().split('\n');
+      const parsed = {};
+      for (const line of lines) {
+        const colonIdx = line.indexOf(':');
+        if (colonIdx > 0) {
+          const key = line.substring(0, colonIdx).trim();
+          const value = line.substring(colonIdx + 1).trim();
+          parsed[key] = value;
+        }
+      }
+
+      // Build OpenCode frontmatter
+      let opencodeFrontmatter = '---\n';
+      if (parsed.name) opencodeFrontmatter += `name: ${parsed.name}\n`;
+      if (parsed.description) opencodeFrontmatter += `description: ${parsed.description}\n`;
+      opencodeFrontmatter += 'mode: subagent\n';
+
+      // Map model names - only include if NOT stripping
+      if (parsed.model && !stripModels) {
+        const modelMap = {
+          'sonnet': 'anthropic/claude-sonnet-4',
+          'opus': 'anthropic/claude-opus-4',
+          'haiku': 'anthropic/claude-haiku-3-5'
+        };
+        opencodeFrontmatter += `model: ${modelMap[parsed.model] || parsed.model}\n`;
+      }
+
+      // Convert tools to permissions
+      if (parsed.tools) {
+        opencodeFrontmatter += 'permission:\n';
+        const tools = parsed.tools.toLowerCase();
+        opencodeFrontmatter += `  read: ${tools.includes('read') ? 'allow' : 'deny'}\n`;
+        opencodeFrontmatter += `  edit: ${tools.includes('edit') || tools.includes('write') ? 'allow' : 'deny'}\n`;
+        opencodeFrontmatter += `  bash: ${tools.includes('bash') ? 'allow' : 'ask'}\n`;
+        opencodeFrontmatter += `  glob: ${tools.includes('glob') ? 'allow' : 'deny'}\n`;
+        opencodeFrontmatter += `  grep: ${tools.includes('grep') ? 'allow' : 'deny'}\n`;
+      }
+
+      opencodeFrontmatter += '---';
+      return opencodeFrontmatter;
+    }
+  );
+}
+
+/**
+ * Transform one markdown file of a skill for OpenCode.
+ *
+ * Same as transformBodyForOpenCode. With `pluginInstallPath`, the plugin-root
+ * wording and versioned-cache paths are pointed at the install path first,
+ * since OpenCode loads the skill from `~/.config/opencode/skills/<name>/`.
+ *
+ * @param {string} content - Markdown content of one file in the skill
+ * @param {string} [repoRoot] - Root whose plugins/ holds the plugins
+ * @param {Object} [options]
+ * @param {string} [options.pluginInstallPath] - Absolute path to plugin install dir
+ * @returns {string}
+ */
+function transformSkillBodyForOpenCode(content, repoRoot, options = {}) {
+  const { pluginInstallPath } = options;
+  if (pluginInstallPath) {
+    content = namePluginRoot(content, pluginInstallPath);
+    content = pointVersionedPathsAtInstallLayout(content, pluginInstallPath, discovery.discoverPlugins(repoRoot));
+  }
+  return transformBodyForOpenCode(content, repoRoot);
+}
+
+function transformForCodex(content, options) {
+  const { skillName, description, pluginInstallPath } = options;
+
+  // Escape description for YAML: wrap in double quotes, escape backslashes and internal quotes
+  const escapedDescription = description.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const yamlDescription = `"${escapedDescription}"`;
+
+  if (content.startsWith('---')) {
+    // Replace existing frontmatter with Codex-compatible format
+    content = content.replace(
+      /^---\n[\s\S]*?\n---\n/,
+      `---\nname: ${skillName}\ndescription: ${yamlDescription}\n---\n`
+    );
+  } else {
+    // Add new frontmatter
+    content = `---\nname: ${skillName}\ndescription: ${yamlDescription}\n---\n\n${content}`;
+  }
+
+  content = pointVersionedPathsAtInstallLayout(content, pluginInstallPath);
+
+  // Transform PLUGIN_ROOT to actual installed path (or placeholder) for Codex
+  content = content.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, pluginInstallPath);
+  content = content.replace(/\$CLAUDE_PLUGIN_ROOT/g, pluginInstallPath);
+  content = content.replace(/\$\{PLUGIN_ROOT\}/g, pluginInstallPath);
+  content = content.replace(/\$PLUGIN_ROOT/g, pluginInstallPath);
+
+  // Transform AskUserQuestion → request_user_input for Codex native tool
+  content = content.replace(/AskUserQuestion/g, 'request_user_input');
+
+  // Remove multiSelect lines (not supported in Codex)
+  content = content.replace(/^[ \t]*multiSelect:.*\n?/gm, '');
+
+  // Inject Codex note about required id field after request_user_input blocks
+  content = content.replace(
+    /^([ \t]*request_user_input:\s*)$/gm,
+    '$1\n> **Codex**: Each question MUST include a unique `id` field (e.g., `id: "q1"`).'
+  );
+
+  return content;
+}
+
+/**
+ * Transform content for Cursor (.mdc rule files).
+ *
+ * MDC format uses YAML frontmatter with `description`, `globs`, and
+ * `alwaysApply` fields followed by a markdown body.
+ *
+ * @param {string} content - Source markdown content (may have frontmatter)
+ * @param {Object} options
+ * @param {string} options.description - Rule description
+ * @param {string} options.pluginInstallPath - Absolute path to plugin install dir
+ * @param {string} [options.globs] - Optional glob pattern for file matching
+ * @param {boolean} [options.alwaysApply] - Whether rule always applies (default true)
+ * @returns {string} Transformed MDC content
+ */
+function transformRuleForCursor(content, options) {
+  const { description = '', pluginInstallPath, globs = '', alwaysApply = true } = options;
+
+  // Strip control characters and escape description for YAML
+  const cleanDescription = description.replace(/[\x00-\x1f\x7f]/g, ' ');
+  const escapedDescription = cleanDescription.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const yamlDescription = `"${escapedDescription}"`;
+
+  // Build MDC frontmatter
+  let frontmatter = `---\ndescription: ${yamlDescription}\n`;
+  if (globs) {
+    frontmatter += `globs: ${JSON.stringify(globs)}\n`;
+  }
+  frontmatter += `alwaysApply: ${alwaysApply}\n---\n`;
+
+  // Strip existing frontmatter if present
+  if (content.startsWith('---')) {
+    content = content.replace(/^---\n[\s\S]*?\n---\n?/, '');
+  }
+
+  content = frontmatter + content;
+
+  // Replace PLUGIN_ROOT paths with actual install path
+  // Use function replacement to avoid $ pattern interpretation in replacement string
+  content = content.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => pluginInstallPath);
+  content = content.replace(/\$CLAUDE_PLUGIN_ROOT/g, () => pluginInstallPath);
+  content = content.replace(/\$\{PLUGIN_ROOT\}/g, () => pluginInstallPath);
+  content = content.replace(/\$PLUGIN_ROOT/g, () => pluginInstallPath);
+
+  // Strip Claude-specific syntax: Task tool calls (handles one level of nested braces)
+  content = content.replace(/await\s+Task\s*\(\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\s*\);?/g, (match) => {
+    const agentMatch = match.match(/subagent_type:\s*["'](?:[^"':]+:)?([^"']+)["']/);
+    if (agentMatch) {
+      return `Invoke the ${agentMatch[1]} agent`;
+    }
+    return '';
+  });
+
+  // Strip require() statements
+  content = content.replace(/(?:const|let|var)\s+\{?[^}=\n]+\}?\s*=\s*require\s*\([^)]+\);?/g, '');
+  content = content.replace(/require\s*\(['"][^'"]+['"]\)/g, '');
+
+  // Strip plugin namespacing (e.g. next-task:agent-name -> agent-name)
+  content = content.replace(/(?:next-task|deslop|ship|sync-docs|audit-project|enhance|perf|repo-map|drift-detect|consult|debate|learn|web-ctl):([a-z][a-z0-9-]*)/g, '$1');
+
+  return content;
+}
+
+/**
+ * Transform skill content for Cursor.
+ *
+ * Minimal transform - Cursor reads SKILL.md frontmatter natively so we
+ * preserve it. Points plugin paths at the install path (pointSkillAtInstallPath)
+ * and strips namespace prefixes. Apply it to every markdown file in the skill
+ * directory.
+ *
+ * @param {string} content - Source SKILL.md content
+ * @param {Object} options
+ * @param {string} options.pluginInstallPath - Absolute path to plugin install dir
+ * @returns {string} Transformed skill content
+ */
+function transformSkillForCursor(content, options) {
+  const { pluginInstallPath } = options;
+
+  content = pointSkillAtInstallPath(content, pluginInstallPath);
+
+  // Strip plugin namespacing (e.g. next-task:agent-name -> agent-name)
+  content = content.replace(/(?:next-task|deslop|ship|sync-docs|audit-project|enhance|perf|repo-map|drift-detect|consult|debate|learn|web-ctl):([a-z][a-z0-9-]*)/g, '$1');
+
+  return content;
+}
+
+/**
+ * Transform command content for Cursor.
+ *
+ * Light transform - strips frontmatter, replaces PLUGIN_ROOT paths,
+ * removes require() statements and Task() calls, strips namespace prefixes.
+ *
+ * @param {string} content - Source command markdown content
+ * @param {Object} options
+ * @param {string} options.pluginInstallPath - Absolute path to plugin install dir
+ * @returns {string} Transformed command content
+ */
+function transformCommandForCursor(content, options) {
+  const { pluginInstallPath } = options;
+
+  // Strip existing frontmatter if present
+  if (content.startsWith('---')) {
+    content = content.replace(/^---\n[\s\S]*?\n---\n?/, '');
+  }
+
+  content = pointVersionedPathsAtInstallLayout(content, pluginInstallPath);
+
+  // Replace PLUGIN_ROOT paths with actual install path
+  content = content.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => pluginInstallPath);
+  content = content.replace(/\$CLAUDE_PLUGIN_ROOT/g, () => pluginInstallPath);
+  content = content.replace(/\$\{PLUGIN_ROOT\}/g, () => pluginInstallPath);
+  content = content.replace(/\$PLUGIN_ROOT/g, () => pluginInstallPath);
+
+  // Strip require() statements
+  content = content.replace(/(?:const|let|var)\s+\{?[^}=\n]+\}?\s*=\s*require\s*\([^)]+\);?/g, '');
+  content = content.replace(/require\s*\(['"][^'"]+['"]\)/g, '');
+
+  // Strip Claude-specific syntax: Task tool calls (handles one level of nested braces)
+  content = content.replace(/await\s+Task\s*\(\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\s*\);?/g, (match) => {
+    const agentMatch = match.match(/subagent_type:\s*["'](?:[^"':]+:)?([^"']+)["']/);
+    if (agentMatch) {
+      return `Invoke the ${agentMatch[1]} agent`;
+    }
+    return '';
+  });
+
+  // Strip plugin namespacing (e.g. next-task:agent-name -> agent-name)
+  content = content.replace(/(?:next-task|deslop|ship|sync-docs|audit-project|enhance|perf|repo-map|drift-detect|consult|debate|learn|web-ctl):([a-z][a-z0-9-]*)/g, '$1');
+
+  return content;
+}
+
+/**
+ * Point plugin paths written for Claude Code's versioned plugin cache at the
+ * agentsys install layout that the other platforms use.
+ *
+ * Claude Code caches a plugin at `<cache>/<plugin>/<version>/`, so plugin
+ * sources reach a sibling plugin through `${CLAUDE_PLUGIN_ROOT}/../../<other>/*\/`
+ * and fall back to globs such as `**\/<plugin>/*\/skills/...`. The agentsys
+ * installer puts each plugin at `~/.agentsys/plugins/<plugin>/` with no version
+ * directory, so the sibling path becomes `<plugins dir>/<other>/` and the glob
+ * gets `**`, which matches with or without a version directory.
+ *
+ * Only globs on a known plugin name change: the plugin itself, the plugins
+ * installed next to it, and `pluginNames`. A glob such as `**\/src/*\/index.ts`
+ * keeps its single directory level.
+ *
+ * @param {string} content
+ * @param {string} [pluginInstallPath] - Install path of the plugin the content belongs to (`<root>/plugins/<plugin>`)
+ * @param {string[]} [pluginNames] - Other plugin names, such as discoverPlugins(repoRoot)
+ * @returns {string}
+ */
+function pointVersionedPathsAtInstallLayout(content, pluginInstallPath, pluginNames = []) {
+  const known = new Set(pluginNames);
+  if (pluginInstallPath) {
+    known.add(path.basename(pluginInstallPath));
+    const pluginsDir = path.dirname(pluginInstallPath);
+    if (pluginsDir !== '.') {
+      content = content.replace(
+        /(?:\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT|\$\{PLUGIN_ROOT\}|\$PLUGIN_ROOT)\/\.\.\/\.\.\/([A-Za-z0-9_-]+)\/\*\//g,
+        (match, plugin) => `${pluginsDir}/${plugin}/`
+      );
+      for (const name of discovery.discoverPlugins(path.dirname(pluginsDir))) known.add(name);
+    }
+  }
+  return content.replace(/\*\*\/([A-Za-z0-9_-]+)\/\*\//g, (match, name) => (known.has(name) ? `**/${name}/**/` : match));
+}
+
+/**
+ * Name the plugin root where a skill locates it relative to itself.
+ *
+ * Inside a plugin, "two directories up from this skill" is the plugin root.
+ * Other platforms load skills from their own skills directory (for example
+ * `~/.kiro/skills/<name>/`, where two directories up is `~/.kiro`), so the
+ * phrase is replaced with the plugin's install path.
+ *
+ * @param {string} content
+ * @param {string} [pluginInstallPath]
+ * @returns {string}
+ */
+function namePluginRoot(content, pluginInstallPath) {
+  if (!pluginInstallPath) return content;
+  return content.replace(
+    /two directories up from (?:this|the) skill(?: \(`\$\{CLAUDE_PLUGIN_ROOT\}` in Claude Code\))?/g,
+    () => `\`${pluginInstallPath}\``
+  );
+}
+
+/**
+ * Point every way a skill file locates its plugin at the plugin's install path:
+ * plugin-root wording, versioned-cache paths, and PLUGIN_ROOT variables.
+ *
+ * @param {string} content
+ * @param {string} pluginInstallPath
+ * @returns {string}
+ */
+function pointSkillAtInstallPath(content, pluginInstallPath) {
+  content = namePluginRoot(content, pluginInstallPath);
+  content = pointVersionedPathsAtInstallLayout(content, pluginInstallPath);
+
+  content = content.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => pluginInstallPath);
+  content = content.replace(/\$CLAUDE_PLUGIN_ROOT/g, () => pluginInstallPath);
+  content = content.replace(/\$\{PLUGIN_ROOT\}/g, () => pluginInstallPath);
+  content = content.replace(/\$PLUGIN_ROOT/g, () => pluginInstallPath);
+  return content;
+}
+
+/**
+ * Transform skill content for Codex.
+ *
+ * Codex reads SKILL.md frontmatter natively, so it is preserved. Points plugin
+ * paths at the install path (pointSkillAtInstallPath) and maps
+ * AskUserQuestion to Codex's request_user_input, as transformForCodex does for
+ * commands. Apply it to every markdown file in the skill directory.
+ *
+ * @param {string} content - Markdown content of one file in the skill
+ * @param {Object} options
+ * @param {string} options.pluginInstallPath - Absolute path to plugin install dir
+ * @returns {string} Transformed skill content
+ */
+function transformSkillForCodex(content, options) {
+  const { pluginInstallPath } = options;
+
+  content = pointSkillAtInstallPath(content, pluginInstallPath);
+  content = content.replace(/AskUserQuestion/g, 'request_user_input');
+  content = content.replace(/^[ \t]*multiSelect:.*\n?/gm, '');
+
+  return content;
+}
+
+/**
+ * Transform skill content for Kiro.
+ *
+ * Minimal transform - Kiro reads standard SKILL.md format natively so we
+ * preserve it. Points plugin paths at the install path
+ * (pointSkillAtInstallPath) and strips namespace prefixes. Apply it to every
+ * markdown file in the skill directory.
+ *
+ * @param {string} content - Source SKILL.md content
+ * @param {Object} options
+ * @param {string} options.pluginInstallPath - Absolute path to plugin install dir
+ * @returns {string} Transformed skill content
+ */
+function transformSkillForKiro(content, options) {
+  const { pluginInstallPath } = options;
+
+  content = pointSkillAtInstallPath(content, pluginInstallPath);
+
+  content = content.replace(/(?:next-task|deslop|ship|sync-docs|audit-project|enhance|perf|repo-map|drift-detect|consult|debate|learn|web-ctl):([a-z][a-z0-9-]*)/g, '$1');
+
+  return content;
+}
+
+/**
+ * Transform command content for Kiro prompt files.
+ *
+ * Strips existing frontmatter, prepends inclusion: manual frontmatter,
+ * replaces PLUGIN_ROOT paths, removes require()/Task() calls, strips namespaces.
+ */
+function transformCommandForKiro(content, options) {
+  const { pluginInstallPath, name = '', description = '' } = options;
+
+  if (content.startsWith('---')) {
+    content = content.replace(/^---\n[\s\S]*?\n---\n?/, '');
+  }
+
+  const cleanDescription = description.replace(/[\x00-\x1f\x7f]/g, ' ');
+  const escapedDescription = cleanDescription.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  let frontmatter = '---\n';
+  frontmatter += 'inclusion: manual\n';
+  if (name) frontmatter += `name: "${name}"\n`;
+  if (description) frontmatter += `description: "${escapedDescription}"\n`;
+  frontmatter += '---\n';
+
+  content = frontmatter + content;
+
+  content = pointVersionedPathsAtInstallLayout(content, pluginInstallPath);
+
+  content = content.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => pluginInstallPath);
+  content = content.replace(/\$CLAUDE_PLUGIN_ROOT/g, () => pluginInstallPath);
+  content = content.replace(/\$\{PLUGIN_ROOT\}/g, () => pluginInstallPath);
+  content = content.replace(/\$PLUGIN_ROOT/g, () => pluginInstallPath);
+
+  content = content.replace(/(?:const|let|var)\s+\{?[^}=\n]+\}?\s*=\s*require\s*\([^)]+\);?/g, '');
+  content = content.replace(/require\s*\(['"][^'"]+['"]\)/g, '');
+
+  // Transform code blocks containing Promise.all + Task() (parallel reviewer spawns).
+  // The bare Task() regex below can't reach inside fenced code blocks.
+  // Fence boundaries must be at line start (^```) to avoid matching backtick
+  // template literals inside the code as false fence endings.
+  content = content.replace(/^```(?:javascript|js)?\n([\s\S]*?)^```$/gm, (fullBlock, codeContent) => {
+    if (!codeContent.includes('Promise.all') || !codeContent.includes('Task(')) return fullBlock;
+    // Use lazy [\s\S]*? for the template literal body: it stops at the first backtick and
+    // naturally matches any character including standalone $ (e.g. $100, $BUDGET).
+    const taskMatches = [...codeContent.matchAll(/Task\s*\(\s*\{[\s\S]*?subagent_type:\s*['"](?:[^"':]+:)?([^'"]+)['"][\s\S]*?prompt:\s*`([\s\S]*?)`/gs)];
+    if (taskMatches.length < 2) return fullBlock;
+
+    const delegations = taskMatches.map(m => {
+      const agent = m[1];
+      const promptFirstLine = m[2].split('\n').find(l => l.trim()) || '';
+      return `Delegate to the \`${agent}\` subagent:\n> ${promptFirstLine.trim()}`;
+    });
+
+    let result = delegations.join('\n\n');
+
+    const hasReviewKeyword = delegations.some(d =>
+      /review|quality|security|performance|test|coverage/i.test(d)
+    );
+    if (delegations.length >= 4 && hasReviewKeyword) {
+      result = `**Review phase (Kiro - max 4 agents, fallback to 2 sequential):**\n\nTry delegating to these subagents (experimental parallel spawning):\n\n${result}\n\nIf parallel spawning is unavailable, run 2 combined reviewers sequentially:\n1. Delegate to the \`reviewer-quality-security\` subagent (code quality + security)\n2. Then delegate to the \`reviewer-perf-test\` subagent (performance + test coverage)\n\nAggregate all findings from whichever execution path succeeded.`;
+    }
+
+    return result;
+  });
+
+  // Transform bare Task() calls outside code blocks
+  content = content.replace(/await\s+Task\s*\(\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}\s*\);?/g, (match) => {
+    const agentMatch = match.match(/subagent_type:\s*["'](?:[^"':]+:)?([^"']+)["']/);
+    const promptMatch = match.match(/prompt:\s*[`"']([\s\S]*?)[`"']/);
+    if (agentMatch) {
+      const agentName = agentMatch[1];
+      const prompt = promptMatch ? promptMatch[1].replace(/\\n/g, '\n').trim() : '';
+      if (prompt) {
+        return `Delegate to the \`${agentName}\` subagent:\n> ${prompt.split('\n')[0]}`;
+      }
+      return `Delegate to the \`${agentName}\` subagent.`;
+    }
+    return '';
+  });
+
+  // Transform AskUserQuestion to markdown prompt for Kiro chat
+  content = content.replace(/(?:await\s+)?AskUserQuestion\s*\(\s*\{[\s\S]*?\}\s*\);?/g, (match) => {
+    const questionMatch = match.match(/question:\s*["'`]([\s\S]*?)["'`]/);
+    const question = questionMatch ? questionMatch[1] : 'Please choose:';
+    const optionMatches = [...match.matchAll(/label:\s*["'`]([^"'`]+)["'`][\s\S]*?description:\s*["'`]([^"'`]+)["'`]/g)];
+    if (optionMatches.length > 0) {
+      const options = optionMatches.map((m, i) => `${i + 1}. **${m[1]}** - ${m[2]}`).join('\n');
+      return `**${question}**\n\n${options}\n\nReply with the number or name of your choice.`;
+    }
+    return `**${question}**\n\nReply in chat with your choice.`;
+  });
+
+  content = content.replace(/(?:next-task|deslop|ship|sync-docs|audit-project|enhance|perf|repo-map|drift-detect|consult|debate|learn|web-ctl):([a-z][a-z0-9-]*)/g, '$1');
+
+  // Batch parallel reviewer delegations for Kiro's agent limit.
+  // Detects 4+ consecutive "Delegate to" lines with review-related names
+  // and rewrites as try-4-then-fallback-to-2 pattern.
+  const reviewerBatchPattern = /((?:Delegate to the `[^`]*` subagent[^\n]*\n){4,})/g;
+  content = content.replace(reviewerBatchPattern, (block) => {
+    const delegations = block.match(/Delegate to the `([^`]+)` subagent/g) || [];
+    if (delegations.length < 4) return block;
+
+    const hasReviewKeyword = delegations.some(d =>
+      /review|quality|security|performance|test|coverage/i.test(d)
+    );
+    if (!hasReviewKeyword) return block;
+
+    return `**Review phase (Kiro - max 4 agents, fallback to 2 sequential):**
+
+Try delegating to these subagents (experimental parallel spawning):
+${block}
+If parallel spawning is unavailable, run 2 combined reviewers sequentially:
+1. Delegate to the \`reviewer-quality-security\` subagent (code quality + security)
+2. Then delegate to the \`reviewer-perf-test\` subagent (performance + test coverage)
+
+Aggregate all findings from whichever execution path succeeded.\n`;
+  });
+
+  return content;
+}
+
+/**
+ * Transform agent markdown+frontmatter to Kiro JSON format.
+ *
+ * Parses frontmatter for name/description/model/tools, uses body as prompt.
+ * Returns a JSON string matching Kiro's agent schema.
+ */
+function transformAgentForKiro(content, options) {
+  const { pluginInstallPath } = options || {};
+
+  const frontmatter = discovery.parseFrontmatter(content);
+  let body = content;
+  if (content.startsWith('---')) {
+    const endIdx = content.indexOf('\n---', 3);
+    if (endIdx !== -1) {
+      body = content.substring(endIdx + 4).replace(/^\n/, '');
+    }
+  }
+
+  body = pointVersionedPathsAtInstallLayout(body, pluginInstallPath);
+
+  if (pluginInstallPath) {
+    body = body.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => pluginInstallPath);
+    body = body.replace(/\$CLAUDE_PLUGIN_ROOT/g, () => pluginInstallPath);
+    body = body.replace(/\$\{PLUGIN_ROOT\}/g, () => pluginInstallPath);
+    body = body.replace(/\$PLUGIN_ROOT/g, () => pluginInstallPath);
+  }
+
+  body = body.replace(/(?:next-task|deslop|ship|sync-docs|audit-project|enhance|perf|repo-map|drift-detect|consult|debate|learn|web-ctl):([a-z][a-z0-9-]*)/g, '$1');
+
+  const agent = {
+    name: frontmatter.name || '',
+    description: frontmatter.description || '',
+    prompt: body.trim()
+  };
+
+  if (frontmatter.tools) {
+    // parseFrontmatter returns arrays for YAML list syntax, string for inline
+    const toolItems = Array.isArray(frontmatter.tools)
+      ? frontmatter.tools.map(t => t.toLowerCase())
+      : [frontmatter.tools.toLowerCase()];
+    const toolStr = toolItems.join(' ');
+    const tools = [];
+    if (toolStr.includes('read')) tools.push('read');
+    if (toolStr.includes('edit') || toolStr.includes('write')) tools.push('write');
+    if (toolStr.includes('bash') || toolStr.includes('shell')) tools.push('shell');
+    if (toolStr.includes('glob')) tools.push('read');
+    if (toolStr.includes('grep')) tools.push('read');
+    if (toolStr.includes('task') || toolStr.includes('agent')) tools.push('shell');
+    if (toolStr.includes('web') || toolStr.includes('fetch')) tools.push('shell');
+    if (toolStr.includes('notebook')) tools.push('write');
+    if (toolStr.includes('lsp')) tools.push('read');
+    const deduped = [...new Set(tools)];
+    agent.tools = deduped.length > 0 ? deduped : ['read'];
+  } else {
+    agent.tools = ['read'];
+  }
+
+  agent.resources = ['file://.kiro/prompts/**/*.md'];
+
+  return JSON.stringify(agent, null, 2);
+}
+
+/**
+ * Generate a combined reviewer agent JSON for Kiro's 4-agent limit.
+ * Merges multiple review responsibilities into a single agent.
+ *
+ * @param {Array<{name: string, focus: string}>} roles - Review passes to combine
+ * @param {string} name - Agent name
+ * @param {string} description - Agent description
+ * @returns {string} JSON string for .kiro/agents/*.json
+ */
+function generateCombinedReviewerAgent(roles, name, description) {
+  const sections = roles.map(r =>
+    `## ${r.name} Review\n\nFocus: ${r.focus}`
+  ).join('\n\n---\n\n');
+
+  const agent = {
+    name,
+    description,
+    prompt: `You are a combined code reviewer covering multiple review passes in a single session.\n\n${sections}\n\nFor each file you review, check ALL of the above review dimensions. Return findings as a JSON array with objects containing: pass (which review), file, line, severity (critical/high/medium/low), description, suggestion.`,
+    tools: ['read'],
+    resources: ['file://.kiro/prompts/**/*.md'],
+  };
+
+  return JSON.stringify(agent, null, 2);
+}
+
+module.exports = {
+  transformBodyForOpenCode,
+  transformCommandFrontmatterForOpenCode,
+  transformAgentFrontmatterForOpenCode,
+  transformSkillBodyForOpenCode,
+  transformForCodex,
+  transformSkillForCodex,
+  transformRuleForCursor,
+  transformSkillForCursor,
+  transformCommandForCursor,
+  transformForCursor: transformRuleForCursor,
+  transformSkillForKiro,
+  transformCommandForKiro,
+  transformAgentForKiro,
+  generateCombinedReviewerAgent
+};

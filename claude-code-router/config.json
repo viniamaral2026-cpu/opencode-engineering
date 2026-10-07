@@ -1,0 +1,14 @@
+{
+  "Providers": [
+    {
+      "name": "openai",
+      "api_base_url": "https://integrate.api.nvidia.com/v1",
+      "api_key": "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",
+      "models": ["nvidia/nemotron", "nvidia/llama-3.1-nemotron-70b-instruct"],
+      "transformer": { "use": ["openai"] }
+    }
+  ],
+  "Router": {
+    "default": "openai,nvidia/nemotron"
+  }
+}
